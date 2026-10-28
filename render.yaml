@@ -1,0 +1,30 @@
+# Render Blueprint when this MHR-CFW repository is selected.
+# For the standalone FWD-app repository, use its root-level render.yaml.
+services:
+  - type: web
+    name: mhr-forwarder-py
+    runtime: python
+    plan: free
+    region: frankfurt
+    rootDir: deploy/upstream_forwarder
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python -u forwarder.py
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: AUTH_KEY
+        sync: false
+      - key: HOST
+        value: 0.0.0.0
+      - key: PYTHON_VERSION
+        value: 3.12.15
+      - key: IMPERSONATE
+        value: chrome
+      - key: TIMEOUT_MS
+        value: "90000"
+      - key: MAX_BODY_BYTES
+        value: "52428800"
+      - key: MAX_REQUEST_BYTES
+        value: "52428800"
+      - key: REDIRECT_LIMIT
+        value: "5"
