@@ -23,6 +23,9 @@ Env:
     TIMEOUT_MS      default 25000
     MAX_BODY_BYTES  default 50 MB
     REDIRECT_LIMIT  default 5
+    TLS_INSECURE_FALLBACK  default 1: when certificate verification fails
+                    (split-fronting targets serve the front domain's
+                    certificate), retry the hop once without verification
     ALLOW_PRIVATE   1 = allow private targets (LOCAL TESTING ONLY)
 """
 
@@ -55,6 +58,7 @@ MAX_BODY = int(os.environ.get("MAX_BODY_BYTES", str(50 * 1024 * 1024)))
 MAX_REQ = int(os.environ.get("MAX_REQUEST_BYTES", str(50 * 1024 * 1024)))
 MAX_ENVELOPE = math.ceil(MAX_REQ * 4 / 3) + 1024 * 1024
 REDIRECT_LIMIT = int(os.environ.get("REDIRECT_LIMIT", "5"))
+TLS_FALLBACK = os.environ.get("TLS_INSECURE_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
 ALLOW_PRIVATE = os.environ.get("ALLOW_PRIVATE", "").strip().lower() in ("1", "true", "yes", "on")
 EGRESS_PROXY = os.environ.get("EGRESS_PROXY", "").strip()
 ALLOWED_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
@@ -241,6 +245,39 @@ def is_redirect(status: int) -> bool:
     return status in (301, 302, 303, 307, 308)
 
 
+# libcurl error codes that mean the TLS handshake itself failed — including
+# CURLE_PEER_FAILED_VERIFICATION (60/51): the server presented a certificate
+# that cannot verify against the dialed SNI.
+_TLS_ERROR_CODES = {35, 51, 58, 60, 64, 66, 77, 80, 82, 83, 90, 91}
+
+
+def is_tls_error(exc: Exception) -> bool:
+    code = getattr(exc, "code", None)
+    if isinstance(code, int) and code in _TLS_ERROR_CODES:
+        return True
+    text = str(exc).lower()
+    return "ssl" in text or "certificate" in text
+
+
+def request_with_tls_fallback(session, method: str, url: str, kwargs: dict):
+    """Issue one hop; on a TLS-verification failure retry once unverified.
+
+    Split-fronting targets (e.g. Psiphon brokers on shared CDN edges) expect
+    a TLS SNI that differs from the HTTP Host we must send, so the edge
+    serves a certificate for the front domain and verification can never
+    pass. The first attempt always verifies; only the proven-verification
+    failure path retries insecurely.
+    """
+    try:
+        return session.request(method, url, **kwargs)
+    except Exception as exc:
+        if not TLS_FALLBACK or not is_tls_error(exc):
+            raise
+        log.warning("TLS verification failed for %s — retrying unverified", safe_host(url))
+        kwargs["verify"] = False
+        return session.request(method, url, **kwargs)
+
+
 def origin_key(url: str) -> tuple[str, str, int | None]:
     parts = urlsplit(url)
     default_port = 443 if parts.scheme.lower() == "https" else 80
@@ -302,7 +339,7 @@ def fetch(method: str, url: str, headers: dict, body: bytes | None, follow: bool
         elif current_method in ("POST", "PUT", "PATCH"):
             kwargs["data"] = b""
 
-        response = session.request(current_method, current, **kwargs)
+        response = request_with_tls_fallback(session, current_method, current, kwargs)
 
         if not follow or not is_redirect(response.status_code):
             return response
@@ -505,7 +542,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"e": error_text(exc)})
         except Exception as exc:
             log.warning("%s %s failed (%s)", method, safe_host(target), exc.__class__.__name__)
-            self.send_json(200, {"e": "upstream request failed"})
+            code = getattr(exc, "code", None)
+            # Report libcurl's error code so the exit Worker can tell a
+            # connect-time failure (target never contacted — failover-safe)
+            # apart from a timeout that may have reached the target.
+            if isinstance(code, int) and code > 0:
+                self.send_json(200, {"e": "upstream request failed (curl %d)" % code})
+            else:
+                self.send_json(200, {"e": "upstream request failed"})
         finally:
             if response is not None:
                 try:
