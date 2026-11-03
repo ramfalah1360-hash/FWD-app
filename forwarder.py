@@ -23,9 +23,11 @@ Env:
     TIMEOUT_MS      default 25000
     MAX_BODY_BYTES  default 50 MB
     REDIRECT_LIMIT  default 5
-    TLS_INSECURE_FALLBACK  default 1: when certificate verification fails
-                    (split-fronting targets serve the front domain's
-                    certificate), retry the hop once without verification
+    TLS_INSECURE_FALLBACK  default 1: when the fronted retry also fails at
+                    TLS level, retry the hop once without verification
+    TLS_FRONT_MAP   extra split-fronting map "suffix=front1|front2,…"
+                    (built-ins: *.akamai.net / *.akamaihd.net / *.akamaized.net
+                    → a248.e.akamai.net)
     ALLOW_PRIVATE   1 = allow private targets (LOCAL TESTING ONLY)
 """
 
@@ -250,6 +252,32 @@ def is_redirect(status: int) -> bool:
 # that cannot verify against the dialed SNI.
 _TLS_ERROR_CODES = {35, 51, 58, 60, 64, 66, 77, 80, 82, 83, 90, 91}
 
+# Split-fronting back-end name suffixes and the front domain(s) whose
+# certificate the CDN edge serves for them. When the TLS handshake to the
+# back-end name fails verification, the request is retried with SNI=front
+# and HTTP Host=back-end (classic domain fronting) — verification stays ON,
+# it simply validates the front certificate. Extend via TLS_FRONT_MAP
+# ("suffix=front1|front2,…,suffix2=…") without a rebuild.
+_FRONT_CANDIDATES = {
+    ".akamai.net": ("a248.e.akamai.net",),
+    ".akamaihd.net": ("a248.e.akamai.net",),
+    ".akamaized.net": ("a248.e.akamai.net",),
+}
+for _pair in os.environ.get("TLS_FRONT_MAP", "").split(","):
+    _suffix, _, _fronts = _pair.partition("=")
+    _suffix = _suffix.strip().lower()
+    _list = tuple(f.strip() for f in _fronts.split("|") if f.strip())
+    if _suffix.startswith(".") and _list:
+        _FRONT_CANDIDATES[_suffix] = _list
+
+
+def front_candidates(url: str) -> tuple:
+    host = (urlsplit(url).hostname or "").lower()
+    for suffix, fronts in _FRONT_CANDIDATES.items():
+        if host.endswith(suffix) and host not in fronts:
+            return fronts
+    return ()
+
 
 def is_tls_error(exc: Exception) -> bool:
     code = getattr(exc, "code", None)
@@ -260,22 +288,47 @@ def is_tls_error(exc: Exception) -> bool:
 
 
 def request_with_tls_fallback(session, method: str, url: str, kwargs: dict):
-    """Issue one hop; on a TLS-verification failure retry once unverified.
+    """Issue one hop; on a TLS-verification failure retry via the front.
 
-    Split-fronting targets (e.g. Psiphon brokers on shared CDN edges) expect
-    a TLS SNI that differs from the HTTP Host we must send, so the edge
-    serves a certificate for the front domain and verification can never
-    pass. The first attempt always verifies; only the proven-verification
-    failure path retries insecurely.
+    Split-fronting targets (e.g. Psiphon brokers behind numbered akamai
+    names) expect a TLS SNI that differs from the HTTP Host we must send,
+    so the edge serves the front domain's certificate and verification can
+    never pass against the dialed name. Retry with SNI=front while keeping
+    Host=back-end — the certificate check is still enforced, just against
+    the front name. If that also fails at TLS level and TLS_INSECURE_FALLBACK
+    is on, retry once unverified (last resort).
     """
     try:
         return session.request(method, url, **kwargs)
     except Exception as exc:
-        if not TLS_FALLBACK or not is_tls_error(exc):
+        fronts = front_candidates(url)
+        if not fronts or not is_tls_error(exc):
             raise
-        log.warning("TLS verification failed for %s — retrying unverified", safe_host(url))
+
+    parts = urlsplit(url)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    last = None
+    for front in fronts:
+        headers = dict(kwargs.get("headers") or {})
+        headers["Host"] = parts.netloc
+        front_kwargs = dict(kwargs)
+        front_kwargs["headers"] = headers
+        try:
+            log.warning("TLS verify failed for %s — retrying fronted via %s",
+                        safe_host(url), front)
+            return session.request(method, "https://" + front + path, **front_kwargs)
+        except Exception as exc2:
+            if not is_tls_error(exc2):
+                raise
+            last = exc2
+
+    if TLS_FALLBACK:
+        log.warning("fronted retry failed for %s — retrying unverified", safe_host(url))
         kwargs["verify"] = False
         return session.request(method, url, **kwargs)
+    raise last
 
 
 def origin_key(url: str) -> tuple[str, str, int | None]:
