@@ -29,6 +29,11 @@ Env:
                     (built-ins: *.akamai.net / *.akamaihd.net / *.akamaized.net
                     → a248.e.akamai.net)
     ALLOW_PRIVATE   1 = allow private targets (LOCAL TESTING ONLY)
+    PROXY_CHAIN_VLESS   optional vless:// URI — boots an Xray sidecar (chain.py)
+                    and routes ALL egress through it, so the exit IP becomes
+                    the VLESS server's. Strict: if the sidecar cannot start,
+                    this service refuses to serve (no silent direct fallback).
+    PROXY_CHAIN_SOCKS_PORT  sidecar listen port, default 10808 (localhost only)
 """
 
 from __future__ import annotations
@@ -104,7 +109,6 @@ if not AUTH_KEY.strip() or len(AUTH_KEY.strip().encode("utf-8")) < 32 or AUTH_KE
     print("FATAL: AUTH_KEY must be a private random key of at least 32 bytes.", file=sys.stderr)
     sys.exit(1)
 
-validate_egress_proxy(EGRESS_PROXY)
 try:
     validate_limits()
 except ValueError as exc:
@@ -117,6 +121,29 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("forwarder")
+
+# ── Proxy Chain: optional VLESS exit (runs BEFORE any session is created) ──
+PROXY_CHAIN_VLESS = os.environ.get("PROXY_CHAIN_VLESS", "").strip()
+CHAIN_SOCKS_PORT = int(os.environ.get("PROXY_CHAIN_SOCKS_PORT", "10808"))
+
+if PROXY_CHAIN_VLESS:
+    # The chain owns the egress. Strict mode: if the Xray sidecar cannot
+    # start, this process exits — serving direct Render egress while the
+    # operator asked for a VLESS exit would silently break that promise.
+    try:
+        import chain as chain_sidecar
+        chain_sidecar.start(PROXY_CHAIN_VLESS, CHAIN_SOCKS_PORT)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print("FATAL: proxy chain failed to start: %s" % exc, file=sys.stderr)
+        sys.exit(1)
+    if EGRESS_PROXY and "127.0.0.1:" not in EGRESS_PROXY:
+        log.warning("EGRESS_PROXY env is ignored while PROXY_CHAIN_VLESS is "
+                    "set — the chain owns the egress")
+    EGRESS_PROXY = "socks5h://127.0.0.1:%d" % CHAIN_SOCKS_PORT
+else:
+    validate_egress_proxy(EGRESS_PROXY)
 
 SKIP_HEADERS = {
     "host",
@@ -143,7 +170,8 @@ STATUS_PAGE = (
     '<body style="font-family:sans-serif;max-width:600px;margin:40px auto">'
     "<h1>Forwarder <span style=\"color:#16a34a;font-weight:700\">Active</span></h1>"
     "<p>mhr-cfw upstream forwarder.</p>"
-    "<p>mode: " + ("proxy egress" if EGRESS_PROXY else "direct egress") + "</p>"
+    "<p>mode: " + ("proxy chain → VLESS exit" if PROXY_CHAIN_VLESS
+                   else ("proxy egress" if EGRESS_PROXY else "direct egress")) + "</p>"
     "</body></html>"
 )
 
