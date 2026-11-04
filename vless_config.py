@@ -80,7 +80,9 @@ def parse_vless_uri(uri: str) -> dict:
         raise VlessError("The server port is missing or invalid.")
 
     try:
-        params = [(k.lower(), unquote(v)) for k, v in parse_qsl(parts.query, keep_blank_values=True)]
+        # parse_qsl already percent-decodes values — do NOT unquote again
+        # (a second decode corrupts values that legitimately contain '%').
+        params = [(k.lower(), v) for k, v in parse_qsl(parts.query, keep_blank_values=True)]
     except ValueError:
         params = []
 
@@ -91,14 +93,17 @@ def parse_vless_uri(uri: str) -> dict:
     network = (_b(params, "type", "tcp") or "tcp").strip().lower()
     if network == "splithttp":
         network = "xhttp"
+    if network == "http":
+        # v2rayN-style export: type=http means tcp with HTTP obfuscation.
+        network = "tcp"
+        if not _b(params, "headertype"):
+            params.append(("headertype", "http"))
     if network in _UDP_NETWORKS:
         raise VlessError('Transport "%s" is not supported (UDP-based) — use tcp/ws/grpc/httpupgrade/xhttp.' % network)
     if network not in _SUPPORTED_NETWORKS:
         raise VlessError('Transport "%s" is not supported.' % network)
 
-    security = (_b(params, "security", "none") or "none").strip().lower()
-    if security in ("", "tls"):
-        security = "tls" if _b(params, "security", "").strip().lower() == "tls" else security or "none"
+    security = (_b(params, "security", "") or "").strip().lower() or "none"
     if security not in ("none", "tls", "reality"):
         raise VlessError('Security "%s" is not supported — use none, tls, or reality.' % security)
     if security == "none" and not _is_private_target(host):
@@ -148,7 +153,7 @@ def parse_vless_uri(uri: str) -> dict:
             reality["spiderX"] = spx
         stream["realitySettings"] = reality
 
-    ws_path = unquote(_b(params, "path", "/") or "/")
+    ws_path = _b(params, "path", "/") or "/"
     ws_host = (_b(params, "host") or "").strip()
     if network == "ws":
         ws = {"path": ws_path or "/"}
