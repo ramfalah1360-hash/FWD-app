@@ -76,11 +76,11 @@ def binary_path() -> str:
     return os.path.join(workdir(), asset_name()[1])
 
 
-def _download(url, dest, tries=3):
+def _download(url, dest, tries=3, timeout=DOWNLOAD_TIMEOUT):
     for attempt in range(1, tries + 1):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "freednet-chain/1.0"})
-            with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as fh:
+            with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as fh:
                 while True:
                     chunk = resp.read(1 << 16)
                     if not chunk:
